@@ -100,6 +100,7 @@ pub const PollClient = struct {
 
     fn write(self: *PollClient) !WriteStatus {
         var buf = self.to_write;
+        defer self.to_write = buf;
 
         while (buf.len > 0) {
             const n = posix.write(self.stream.handle, buf) catch |err| switch (err) {
