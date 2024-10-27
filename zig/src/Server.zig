@@ -1,22 +1,26 @@
 const std = @import("std");
 const posix = std.posix;
-const Client = @import("clients.zig").PollClient;
+const PollClient = @import("clients.zig").PollClient;
 const log = std.log.scoped(.server);
 
 const Self = @This();
 
+alloc: std.mem.Allocator,
+client_pool: std.heap.MemoryPool(PollClient),
 address: std.net.Address,
 poll_fds: std.ArrayList(posix.pollfd),
-clients: std.ArrayList(Client),
+clients: std.ArrayList(*PollClient),
 max_clients: usize,
 
 pub fn init(alloc: std.mem.Allocator, address: std.net.Address, max_clients: usize) Self {
     std.debug.assert(max_clients > 0);
 
     return Self{
+        .alloc = alloc,
+        .client_pool = std.heap.MemoryPool(PollClient).init(alloc),
         .address = address,
         .poll_fds = std.ArrayList(posix.pollfd).init(alloc),
-        .clients = std.ArrayList(Client).init(alloc),
+        .clients = std.ArrayList(*PollClient).init(alloc),
         .max_clients = max_clients,
     };
 }
@@ -26,6 +30,11 @@ pub fn deinit(self: *Self) void {
         posix.close(pfd.fd);
     }
     self.poll_fds.deinit();
+    for (self.clients.items) |client| {
+        self.client_pool.destroy(client);
+    }
+    self.clients.deinit();
+    self.client_pool.deinit();
 }
 
 pub fn run(self: *Self) !void {
@@ -36,7 +45,6 @@ pub fn run(self: *Self) !void {
 
     try self.poll_fds.append(.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 });
 
-    var read_buf: [4096]u8 = undefined;
     while (true) {
         _ = try posix.poll(self.poll_fds.items, -1);
         const accepted = try self.accept();
@@ -53,20 +61,15 @@ pub fn run(self: *Self) !void {
                 continue;
             }
 
-            const read = posix.read(pfd.fd, &read_buf) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => blk: {
-                    log.err("read error: {}", .{err});
-                    break :blk 0;
-                },
-            };
-            if (read == 0) {
-                log.info("closing client reason=0read", .{});
+            const client = self.clients.items[i - 1];
+            const read_result = client.readMessage() catch |err| {
+                log.err("[{}] read error: {}", .{ client.address, err });
                 self.removeClient(&i);
                 continue;
-            }
+            };
+            const msg = if (read_result) |msg| msg else continue;
 
-            log.info("received: {s}", .{read_buf[0..read]});
+            log.info("received: {s}", .{msg});
         }
     }
 }
@@ -93,12 +96,22 @@ fn accept(self: *Self) !usize {
     const available = self.max_clients - self.poll_fds.items.len - 1;
     var accepted: usize = 0;
     for (0..available) |_| {
-        const conn = posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK) catch |err| switch (err) {
+        var address: std.net.Address = undefined;
+        var address_len: posix.socklen_t = @sizeOf(std.net.Address);
+
+        const conn = posix.accept(listener.fd, &address.any, &address_len, posix.SOCK.NONBLOCK) catch |err| switch (err) {
             error.WouldBlock => return accepted,
             else => return err,
         };
 
         try self.poll_fds.append(.{ .fd = conn, .events = posix.POLL.IN, .revents = 0 });
+        {
+            const client = try self.client_pool.create();
+            errdefer self.client_pool.destroy(client);
+            client.* = try PollClient.init(self.alloc, conn, address);
+            errdefer client.deinit(self.alloc);
+            try self.clients.append(client);
+        }
         accepted += 1;
     } else {
         self.poll_fds.items[0].events = 0;
@@ -107,8 +120,13 @@ fn accept(self: *Self) !usize {
 }
 
 fn removeClient(self: *Self, index: *usize) void {
+    std.debug.assert(index.* > 0);
+
     const removed = self.poll_fds.swapRemove(index.*);
+    const removed_client = self.clients.swapRemove(index.* - 1);
+
     posix.close(removed.fd);
+    self.client_pool.destroy(removed_client);
     index.* -= 1;
     self.poll_fds.items[0].events = posix.POLL.IN;
 }
