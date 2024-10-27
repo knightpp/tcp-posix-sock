@@ -10,7 +10,7 @@ pub fn main() !void {
 
     const address = try net.Address.resolveIp("127.0.0.1", 5882);
 
-    var server = lib.Server.init(alloc, address);
+    var server = lib.Server.init(alloc, address, 4096);
     defer server.deinit();
 
     try server.run();

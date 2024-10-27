@@ -2,8 +2,12 @@ const std = @import("std");
 const posix = std.posix;
 const testing = std.testing;
 
-const Prefix = usize;
-const prefix_size = @sizeOf(Prefix);
+pub const Prefix = usize;
+pub const prefix_size = @sizeOf(Prefix);
+
+pub fn prefixBytes(len: Prefix) [prefix_size]u8 {
+    return std.mem.toBytes(len);
+}
 
 pub fn writeMessage(stream: std.net.Stream, payload: []const u8) !void {
     var prefix: [prefix_size]u8 = undefined;
@@ -57,9 +61,18 @@ pub fn writevAll(stream: std.net.Stream, vec: []posix.iovec_const) !void {
 pub const Reader = struct {
     const Self = @This();
 
-    buf: [256]u8 = std.mem.zeroes([256]u8),
+    buf: []u8,
     pos: usize = 0,
     start: usize = 0,
+
+    pub fn init(alloc: std.mem.Allocator, size: usize) !Self {
+        return Self{ .buf = try alloc.alloc(u8, size) };
+    }
+
+    pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+        alloc.free(self.buf);
+        self.buf = &.{};
+    }
 
     pub fn readMessage(self: *Self, stream: std.net.Stream) ![]u8 {
         while (true) {
@@ -122,7 +135,9 @@ pub const Reader = struct {
         const stream = std.net.Stream{ .handle = @intCast(fd) };
         try writeMessage(stream, "hello");
         try file.seekTo(0);
-        var r = Reader{};
+        const alloc = std.testing.allocator;
+        var r = try Reader.init(alloc, 128);
+        defer r.deinit(alloc);
 
         const msg = try r.readMessage(stream);
         try testing.expectEqualStrings("hello", msg);
@@ -133,7 +148,9 @@ pub const Reader = struct {
         const file = std.fs.File{ .handle = @intCast(fd) };
         defer file.close();
         const stream = std.net.Stream{ .handle = @intCast(fd) };
-        var r = Reader{};
+        const alloc = std.testing.allocator;
+        var r = try Reader.init(alloc, 128);
+        defer r.deinit(alloc);
 
         try writeMessage(stream, "hello");
         try writeMessage(stream, "world");
@@ -150,7 +167,9 @@ pub const Reader = struct {
         const file = std.fs.File{ .handle = @intCast(fd) };
         defer file.close();
         const stream = std.net.Stream{ .handle = @intCast(fd) };
-        var r = Reader{};
+        const alloc = std.testing.allocator;
+        var r = try Reader.init(alloc, 256);
+        defer r.deinit(alloc);
 
         try writeMessage(stream, "m" ** (256 - prefix_size));
         try file.seekTo(0);
