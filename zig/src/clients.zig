@@ -40,6 +40,7 @@ const SyncClient = struct {
 
 pub const PollClient = struct {
     const Self = @This();
+    const log = std.log.scoped(.poll_client);
 
     address: std.net.Address,
     stream: std.net.Stream,
@@ -82,7 +83,7 @@ pub const PollClient = struct {
         if (self.to_write.len > 0) {
             return error.PendingMessage;
         }
-        if (self.write_buf.len > msg.len + proto.prefix_size) {
+        if (msg.len + proto.prefix_size > self.write_buf.len) {
             return error.MessageTooLarge;
         }
 
@@ -98,7 +99,7 @@ pub const PollClient = struct {
         complete,
     };
 
-    fn write(self: *PollClient) !WriteStatus {
+    pub fn write(self: *PollClient) !WriteStatus {
         var buf = self.to_write;
         defer self.to_write = buf;
 
