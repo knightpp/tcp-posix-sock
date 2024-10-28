@@ -51,25 +51,39 @@ pub fn run(self: *Self) !void {
 
         var i: usize = 1;
         while (i < self.poll_fds.items.len - accepted) : (i += 1) {
-            const pfd = self.poll_fds.items[i];
-            if (pfd.revents == 0) {
-                continue;
-            }
-            if (pfd.revents & posix.POLL.HUP == posix.POLL.HUP) {
-                log.info("closing client reason=HUP", .{});
+            self.processPollFD(i) catch |err| {
+                log.info("[{}] io error: {}", .{ self.clients.items[i - 1].address, err });
                 self.removeClient(&i);
-                continue;
-            }
-
-            const client = self.clients.items[i - 1];
-            const read_result = client.readMessage() catch |err| {
-                log.err("[{}] read error: {}", .{ client.address, err });
-                self.removeClient(&i);
-                continue;
             };
-            const msg = if (read_result) |msg| msg else continue;
+        }
+    }
+}
 
-            log.info("received: {s}", .{msg});
+fn processPollFD(self: *Self, i: usize) !void {
+    const pfd = &self.poll_fds.items[i];
+    if (pfd.revents == 0) {
+        return;
+    }
+    if (pfd.revents & posix.POLL.HUP == posix.POLL.HUP) {
+        return error.PollHUP;
+    }
+
+    const client = self.clients.items[i - 1];
+    if (hasPollBit(pfd.revents, posix.POLL.IN)) {
+        const read_result = try client.readMessage();
+        const msg = if (read_result) |msg| msg else return;
+
+        log.debug("received: {s}", .{msg});
+        if (try client.writeMessage(msg) == .complete) {
+            return;
+        }
+
+        pfd.*.events = posix.POLL.OUT;
+    } else if (hasPollBit(pfd.events, posix.POLL.OUT)) {
+        const write_status = try client.write();
+        if (write_status == .complete) {
+            pfd.*.events = posix.POLL.IN;
+            return;
         }
     }
 }
@@ -129,4 +143,8 @@ fn removeClient(self: *Self, index: *usize) void {
     self.client_pool.destroy(removed_client);
     index.* -= 1;
     self.poll_fds.items[0].events = posix.POLL.IN;
+}
+
+fn hasPollBit(revents: i16, comptime bit: i16) bool {
+    return revents & bit == bit;
 }
