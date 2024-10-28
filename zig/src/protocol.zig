@@ -6,7 +6,9 @@ pub const Prefix = usize;
 pub const prefix_size = @sizeOf(Prefix);
 
 pub fn prefixBytes(len: Prefix) [prefix_size]u8 {
-    return std.mem.toBytes(len);
+    var out: [prefix_size]u8 = undefined;
+    std.mem.writeInt(Prefix, &out, len, .little);
+    return out;
 }
 
 pub fn writeMessage(stream: std.net.Stream, payload: []const u8) !void {
@@ -22,7 +24,10 @@ pub fn writeMessage(stream: std.net.Stream, payload: []const u8) !void {
 
 pub fn readMessage(stream: std.net.Stream, out: *std.ArrayList(u8)) !void {
     var prefix: [prefix_size]u8 = undefined;
-    _ = try stream.readAll(&prefix);
+    const read = try stream.readAll(&prefix);
+    if (read < prefix.len) {
+        return error.Closed;
+    }
     const size = std.mem.readInt(Prefix, &prefix, .little);
 
     try out.resize(size);
