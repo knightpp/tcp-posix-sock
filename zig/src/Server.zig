@@ -117,15 +117,20 @@ fn accept(self: *Self) !usize {
             error.WouldBlock => return accepted,
             else => return err,
         };
+        errdefer posix.close(conn);
+
+        const client = try self.client_pool.create();
+        errdefer self.client_pool.destroy(client);
+
+        client.* = try PollClient.init(self.alloc, conn, address);
+        errdefer client.deinit(self.alloc);
+
+        try self.clients.append(client);
+        errdefer self.clients.pop();
 
         try self.poll_fds.append(.{ .fd = conn, .events = posix.POLL.IN, .revents = 0 });
-        {
-            const client = try self.client_pool.create();
-            errdefer self.client_pool.destroy(client);
-            client.* = try PollClient.init(self.alloc, conn, address);
-            errdefer client.deinit(self.alloc);
-            try self.clients.append(client);
-        }
+        errdefer self.poll_fds.pop();
+
         accepted += 1;
     } else {
         self.poll_fds.items[0].events = 0;
