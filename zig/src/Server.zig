@@ -2,14 +2,21 @@ const std = @import("std");
 const posix = std.posix;
 const PollClient = @import("clients.zig").PollClient;
 const log = std.log.scoped(.server);
+const milliTimestamp = std.time.milliTimestamp;
 
 const Self = @This();
+const TimeoutList = std.DoublyLinkedList(*PollClient);
+const READ_TIMEOUT_MS = 1_000;
 
 alloc: std.mem.Allocator,
-client_pool: std.heap.MemoryPool(PollClient),
 address: std.net.Address,
 poll_fds: std.ArrayList(posix.pollfd),
+
+client_pool: std.heap.MemoryPool(PollClient),
 clients: std.ArrayList(*PollClient),
+timeout_pool: std.heap.MemoryPool(TimeoutList.Node),
+timeouts: TimeoutList,
+
 max_clients: usize,
 
 pub fn init(alloc: std.mem.Allocator, address: std.net.Address, max_clients: usize) Self {
@@ -22,6 +29,8 @@ pub fn init(alloc: std.mem.Allocator, address: std.net.Address, max_clients: usi
         .poll_fds = std.ArrayList(posix.pollfd).init(alloc),
         .clients = std.ArrayList(*PollClient).init(alloc),
         .max_clients = max_clients,
+        .timeouts = .{},
+        .timeout_pool = std.heap.MemoryPool(TimeoutList.Node).init(alloc),
     };
 }
 
@@ -42,11 +51,12 @@ pub fn run(self: *Self) !void {
 
     try self.clients.ensureTotalCapacityPrecise(self.max_clients);
     try self.poll_fds.ensureTotalCapacityPrecise(self.max_clients + 1);
-
     try self.poll_fds.append(.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 });
 
     while (true) {
-        _ = try posix.poll(self.poll_fds.items, -1);
+        const timeout = self.enforceTimeout();
+
+        _ = try posix.poll(self.poll_fds.items, timeout);
         const accepted = try self.accept();
 
         var i: usize = 1;
@@ -56,6 +66,23 @@ pub fn run(self: *Self) !void {
                 self.removeClient(&i);
             };
         }
+    }
+}
+
+fn enforceTimeout(self: *Self) i32 {
+    const now = milliTimestamp();
+
+    var node = self.timeouts.first;
+    while (node) |n| {
+        const client = n.data;
+        const diff = client.read_timeout_ms - now;
+        if (diff > 0) {
+            return @intCast(diff);
+        }
+        posix.shutdown(client.stream.handle, .recv) catch {};
+        node = n.next;
+    } else {
+        return -1;
     }
 }
 
@@ -71,7 +98,11 @@ fn processPollFD(self: *Self, i: usize) !void {
     const client = self.clients.items[i - 1];
     if (hasPollBit(pfd.revents, posix.POLL.IN)) {
         const read_result = try client.readMessage();
-        const msg = if (read_result) |msg| msg else return;
+        client.read_timeout_ms = milliTimestamp() + READ_TIMEOUT_MS;
+        self.timeouts.remove(client.timeout_node);
+        self.timeouts.append(client.timeout_node);
+
+        const msg: []u8 = if (read_result) |msg| msg else return;
 
         log.debug("received: {s}", .{msg});
         if (try client.writeMessage(msg) == .complete) {
@@ -119,17 +150,25 @@ fn accept(self: *Self) !usize {
         };
         errdefer posix.close(conn);
 
-        const client = try self.client_pool.create();
+        const client: *PollClient = try self.client_pool.create();
         errdefer self.client_pool.destroy(client);
 
         client.* = try PollClient.init(self.alloc, conn, address);
         errdefer client.deinit(self.alloc);
 
+        client.read_timeout_ms = milliTimestamp() + READ_TIMEOUT_MS;
+        client.timeout_node = try self.timeout_pool.create();
+        errdefer self.timeout_pool.destroy(client.timeout_node);
+        client.timeout_node.data = client;
+
+        self.timeouts.append(client.timeout_node);
+        errdefer _ = self.timeouts.pop();
+
         try self.clients.append(client);
-        errdefer self.clients.pop();
+        errdefer _ = self.clients.pop();
 
         try self.poll_fds.append(.{ .fd = conn, .events = posix.POLL.IN, .revents = 0 });
-        errdefer self.poll_fds.pop();
+        errdefer _ = self.poll_fds.pop();
 
         accepted += 1;
     } else {
@@ -141,11 +180,14 @@ fn accept(self: *Self) !usize {
 fn removeClient(self: *Self, index: *usize) void {
     std.debug.assert(index.* > 0);
 
-    const removed = self.poll_fds.swapRemove(index.*);
-    const removed_client = self.clients.swapRemove(index.* - 1);
+    const pollfd = self.poll_fds.swapRemove(index.*);
+    posix.close(pollfd.fd);
 
-    posix.close(removed.fd);
-    self.client_pool.destroy(removed_client);
+    const client = self.clients.swapRemove(index.* - 1);
+
+    self.timeouts.remove(client.timeout_node);
+    self.timeout_pool.destroy(client.timeout_node);
+    self.client_pool.destroy(client);
     index.* -= 1;
     self.poll_fds.items[0].events = posix.POLL.IN;
 }

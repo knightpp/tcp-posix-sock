@@ -47,6 +47,8 @@ pub const PollClient = struct {
     reader: proto.Reader,
     to_write: []u8,
     write_buf: []u8,
+    read_timeout_ms: i64,
+    timeout_node: *std.DoublyLinkedList(*Self).Node,
 
     pub fn init(alloc: std.mem.Allocator, socket: posix.socket_t, address: std.net.Address) !Self {
         var reader = try proto.Reader.init(alloc, 4096);
@@ -61,6 +63,8 @@ pub const PollClient = struct {
             .reader = reader,
             .write_buf = write_buf,
             .to_write = &.{},
+            .read_timeout_ms = 0, // server sets this
+            .timeout_node = undefined, // HACK: is set after init
         };
     }
 
